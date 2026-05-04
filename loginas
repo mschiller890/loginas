@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+IFS=$'\n\t'
+
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly MIN_UID=0          # allow switching to system accounts too
+readonly MAX_USERNAME_LEN=32
+
+if [[ -t 2 ]]; then
+  RED=$'\033[0;31m'; YELLOW=$'\033[0;33m'
+  GREEN=$'\033[0;32m'; CYAN=$'\033[0;36m'; RESET=$'\033[0m'
+else
+  RED=''; YELLOW=''; GREEN=''; CYAN=''; RESET=''
+fi
+
+log_info()  { printf '%s[INFO]%s %s\n'  "$CYAN"  "$RESET" "$*" >&2; }
+log_warn()  { printf '%s[WARN]%s %s\n'  "$YELLOW" "$RESET" "$*" >&2; }
+log_error() { printf '%s[ERRO]%s %s\n'  "$RED"    "$RESET" "$*" >&2; }
+log_debug() { [[ "${LOGINAS_DEBUG:-0}" == "1" ]] && \
+              printf '%s[DEBG]%s %s\n'  "$GREEN"   "$RESET" "$*" >&2 || true; }
+
+usage() {
+  cat >&2 <<EOF
+
+${YELLOW}Usage:${RESET}
+  ${SCRIPT_NAME} <username>          Open a login shell as <username>
+  ${SCRIPT_NAME} --help | -h         Show this help message
+  ${SCRIPT_NAME} --list | -l         List non-system users available on this host
+
+${YELLOW}Options:${RESET}
+  --shell <path>              Override the user's default shell (e.g. /bin/bash)
+  --no-color                  Disable colour output
+
+${YELLOW}Environment:${RESET}
+  LOGINAS_DEBUG=1             Enable debug output
+EOF
+}
+
+validate_username() {
+  local username="$1"
+
+  if [[ -z "$username" ]]; then
+    log_error "Username must not be empty."
+    return 1
+  fi
+
+  if (( ${#username} > MAX_USERNAME_LEN )); then
+    log_error "Username exceeds maximum length of ${MAX_USERNAME_LEN} characters."
+    return 1
+  fi
+
+  if [[ ! "$username" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.\-]*$ ]]; then
+    log_error "Username '${username}' contains invalid characters."
+    log_error "Allowed: letters, digits, underscore, hyphen, dot (cannot start with hyphen/dot)."
+    return 1
+  fi
+
+  if [[ "$username" == *"/"* || "$username" == *".."* ]]; then
+    log_error "Username must not contain path components."
+    return 1
+  fi
+
+  return 0
+}
+
+check_privileges() {
+  log_debug "Effective UID: ${EUID}"
+
+  if (( EUID == 0 )); then
+    log_debug "Running as root — full privilege confirmed."
+    return 0
+  fi
+
+  if ! command -v sudo &>/dev/null; then
+    log_error "This script must be run as root (sudo not found)."
+    return 1
+  fi
+
+  if sudo -n true 2>/dev/null; then
+    log_debug "sudo available with cached credentials."
+    return 0
+  fi
+
+  log_warn "Root privileges are required. You may be prompted for your sudo password."
+  if sudo true; then
+    return 0
+  fi
+
+  log_error "Failed to obtain root privileges via sudo."
+  return 1
+}
+
+user_exists() {
+  local username="$1"
+  if id -- "$username" &>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+resolve_shell() {
+  local username="$1"
+  local override_shell="${2:-}"
+
+  if [[ -n "$override_shell" ]]; then
+    if [[ ! -x "$override_shell" ]]; then
+      log_error "Specified shell '${override_shell}' is not executable."
+      return 1
+    fi
+    echo "$override_shell"
+    return 0
+  fi
+
+  local user_shell
+  user_shell="$(getent passwd -- "$username" | cut -d: -f7)"
+
+  if [[ -z "$user_shell" ]]; then
+    log_warn "Could not determine shell for '${username}'; falling back to /bin/sh."
+    user_shell="/bin/sh"
+  fi
+
+  if [[ ! -x "$user_shell" ]]; then
+    log_warn "User shell '${user_shell}' is not executable; falling back to /bin/sh."
+    user_shell="/bin/sh"
+  fi
+
+  case "$user_shell" in
+    /sbin/nologin|/usr/sbin/nologin|/bin/false|/usr/bin/false)
+      log_warn "User '${username}' has a no-login shell (${user_shell})."
+      log_warn "Proceeding anyway — use --shell to override if needed."
+      ;;
+  esac
+
+  echo "$user_shell"
+}
+
+list_users() {
+  local uid_threshold=1000
+
+  log_info "Non-system users on this host (UID >= ${uid_threshold}):"
+  while IFS=: read -r uname _ uid _ gecos home shell; do
+    if (( uid >= uid_threshold )); then
+      printf '  %-20s uid=%-6s home=%-30s shell=%s\n' \
+        "$uname" "$uid" "$home" "$shell"
+    fi
+  done < /etc/passwd | sort
+}
+
+audit_log() {
+  local target_user="$1"
+  local acting_user="${SUDO_USER:-${USER:-$(id -un)}}"
+  local entry
+  entry="$(date --iso-8601=seconds) loginas: ${acting_user} -> ${target_user}"
+
+  if command -v logger &>/dev/null; then
+    logger -t loginas -p auth.notice \
+      "User '${acting_user}' switched to '${target_user}'"
+  fi
+
+  local audit_file="/var/log/loginas.log"
+  if [[ -w "$(dirname "$audit_file")" ]]; then
+    echo "$entry" >> "$audit_file" 2>/dev/null || true
+  fi
+
+  log_debug "Audit entry: ${entry}"
+}
+
+switch_user() {
+  local target_user="$1"
+  local shell="$2"
+
+  local -a cmd
+
+  if (( EUID == 0 )); then
+    cmd=(su -s "$shell" -l "$target_user")
+  else
+    cmd=(sudo -i -u "$target_user" -- "$shell" -l)
+  fi
+
+  ( IFS=' '; log_debug "Command: ${cmd[*]}" )
+
+  audit_log "$target_user"
+
+  log_info "Switching to user '${target_user}' (shell: ${shell})..."
+  log_info "Type 'exit' or press Ctrl-D to return."
+
+  exec "${cmd[@]}"
+}
+
+main() {
+  local target_user=""
+  local override_shell=""
+
+  if (( $# == 0 )); then
+    log_error "No username provided."
+    usage
+    exit 1
+  fi
+
+  while (( $# > 0 )); do
+    case "$1" in
+      -h|--help)
+        usage; exit 0 ;;
+      -l|--list)
+        list_users; exit 0 ;;
+      --no-color)
+        RED=''; YELLOW=''; GREEN=''; CYAN=''; RESET=''
+        shift ;;
+      --shell)
+        if [[ -z "${2:-}" ]]; then
+          log_error "--shell requires an argument."
+          exit 1
+        fi
+        override_shell="$2"; shift 2 ;;
+      --shell=*)
+        override_shell="${1#*=}"; shift ;;
+      --)
+        shift; break ;;
+      -*)
+        log_error "Unknown option: $1"
+        usage; exit 1 ;;
+      *)
+        if [[ -n "$target_user" ]]; then
+          log_error "Unexpected argument: $1 (username already set to '${target_user}')."
+          usage; exit 1
+        fi
+        target_user="$1"; shift ;;
+    esac
+  done
+
+  if [[ -z "$target_user" && -n "${1:-}" ]]; then
+    target_user="$1"
+  fi
+
+  if [[ -z "$target_user" ]]; then
+    log_error "No username provided."
+    usage; exit 1
+  fi
+
+  validate_username "$target_user"   || exit 1
+  check_privileges                   || exit 1
+
+  if ! user_exists "$target_user"; then
+    log_error "User '${target_user}' does not exist on this system."
+    log_info  "Tip: run '${SCRIPT_NAME} --list' to see available users."
+    exit 1
+  fi
+
+  local current_user
+  current_user="${SUDO_USER:-${USER:-$(id -un)}}"
+  if [[ "$target_user" == "$current_user" ]]; then
+    log_warn "You are already logged in as '${target_user}'."
+    exit 0
+  fi
+
+  local resolved_shell
+  resolved_shell="$(resolve_shell "$target_user" "$override_shell")" || exit 1
+  log_debug "Resolved shell: ${resolved_shell}"
+
+  switch_user "$target_user" "$resolved_shell"
+}
+
+main "$@"
